@@ -133,7 +133,7 @@ if not file_path:
 # -----------------------------
 img_array = np.fromfile(file_path, np.uint8)
 img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-
+git
 if img is None:
     print("이미지를 읽을 수 없습니다.")
     print("선택한 파일 경로:", file_path)
