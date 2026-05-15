@@ -3,159 +3,123 @@ import tkinter as tk
 from tkinter import filedialog
 import math
 import numpy as np
-
+import sys
 
 # -----------------------------
 # 손가락 개수 추정 함수
 # -----------------------------
 def count_fingers(img):
-    # 이미지 크기 줄이기
-    img = cv2.resize(img, (640, 480))
+    # 이미지 크기가 너무 크면 처리가 느리고 인식이 안 될 수 있으므로 리사이징
+    height, width = img.shape[:2]
+    scaling_factor = 640 / width
+    img = cv2.resize(img, None, fx=scaling_factor, fy=scaling_factor, interpolation=cv2.INTER_AREA)
 
-    # 원본 복사
     output = img.copy()
 
-    # BGR → HSV 변환
+    # 1. BGR → HSV 변환 (조명 변화에 강함)
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
-    # 피부색 범위 설정
-    # 조명에 따라 이 값은 조금씩 바꿔야 할 수 있음
-    lower_skin = (0, 30, 60)
-    upper_skin = (25, 180, 255)
+    # 2. 피부색 범위 설정 (한국인 피부색에 좀 더 보편적인 범위로 미세 조정)
+    lower_skin = np.array([0, 20, 70], dtype="uint8")
+    upper_skin = np.array([20, 255, 255], dtype="uint8")
 
-    # 피부색 영역만 마스크로 추출
+    # 3. 피부색 마스크 생성 및 노이즈 제거
     mask = cv2.inRange(hsv, lower_skin, upper_skin)
-
-    # 노이즈 제거
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.erode(mask, kernel, iterations=1)
+    mask = cv2.dilate(mask, kernel, iterations=2)
     mask = cv2.GaussianBlur(mask, (5, 5), 0)
-    mask = cv2.erode(mask, None, iterations=2)
-    mask = cv2.dilate(mask, None, iterations=2)
 
-    # 윤곽선 찾기
-    contours, _ = cv2.findContours(
-        mask,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
-    )
+    # 4. 윤곽선 찾기
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     if not contours:
         return output, mask, 0, "손을 찾을 수 없습니다."
 
     # 가장 큰 윤곽선을 손이라고 가정
     hand_contour = max(contours, key=cv2.contourArea)
-
     area = cv2.contourArea(hand_contour)
 
-    if area < 3000:
-        return output, mask, 0, "손 영역이 너무 작습니다."
+    # 손 영역이 너무 작으면 무시 (노이즈 방지)
+    if area < 5000:
+        return output, mask, 0, "손 영역이 너무 작거나 멀리 있습니다."
 
-    # 손 윤곽선 그리기
-    cv2.drawContours(output, [hand_contour], -1, (0, 255, 0), 2)
-
-    # 볼록 껍질 계산
-    hull = cv2.convexHull(hand_contour, returnPoints=False)
-
+    # 5. 볼록 껍질(Convex Hull) 및 볼록 결함(Convexity Defects) 계산
+    # 근사화 작업을 통해 노이즈를 줄임
+    epsilon = 0.001 * cv2.arcLength(hand_contour, True)
+    approx_contour = cv2.approxPolyDP(hand_contour, epsilon, True)
+    
+    hull = cv2.convexHull(approx_contour, returnPoints=False)
+    
     if hull is None or len(hull) < 3:
-        return output, mask, 0, "손 모양을 분석할 수 없습니다."
+        return output, mask, 0, "손 모양 분석 실패"
 
-    # 볼록 결함 계산
-    defects = cv2.convexityDefects(hand_contour, hull)
-
-    if defects is None:
-        return output, mask, 0, "손가락 사이를 찾을 수 없습니다."
+    defects = cv2.convexityDefects(approx_contour, hull)
 
     finger_gaps = 0
 
-    for i in range(defects.shape[0]):
-        s, e, f, d = defects[i][0]
+    if defects is not None:
+        for i in range(defects.shape[0]):
+            s, e, f, d = defects[i][0]
+            start = tuple(approx_contour[s][0])
+            end = tuple(approx_contour[e][0])
+            far = tuple(approx_contour[f][0])
 
-        start = tuple(hand_contour[s][0])
-        end = tuple(hand_contour[e][0])
-        far = tuple(hand_contour[f][0])
+            # 세 점 사이 거리 계산
+            a = math.dist(start, end)
+            b = math.dist(start, far)
+            c = math.dist(end, far)
 
-        # 세 점 사이 거리 계산
-        a = math.dist(start, end)
-        b = math.dist(start, far)
-        c = math.dist(end, far)
+            # 코사인 법칙으로 각도 계산 (손가락 사이의 각도는 보통 90도 미만)
+            angle = math.acos((b**2 + c**2 - a**2) / (2 * b * c + 1e-6)) * 180 / math.pi
 
-        # 코사인 법칙으로 각도 계산
-        if b * c == 0:
-            continue
+            # d(깊이) 값이 일정 수준 이상이어야 실제 손가락 사이 골짜기로 인정
+            if angle <= 90 and d > 12000:
+                finger_gaps += 1
+                cv2.circle(output, far, 8, [0, 0, 255], -1) # 골짜기 표시
+                cv2.line(output, start, end, [0, 255, 0], 2) # 손가락 연결선
 
-        angle = math.degrees(
-            math.acos((b * b + c * c - a * a) / (2 * b * c))
-        )
-
-        # 손가락 사이 골짜기 조건
-        if angle < 90 and d > 10000:
-            finger_gaps += 1
-            cv2.circle(output, far, 8, (0, 0, 255), -1)
-
-    # 손가락 사이 공간 개수 + 1 = 손가락 개수 추정
+    # 손가락 개수 = 골짜기 개수 + 1 (단, 주먹 쥐었을 때 등 예외 처리)
     fingers = finger_gaps + 1
+    if fingers > 5: fingers = 5
+    if finger_gaps == 0 and area > 10000: fingers = 1 # 골짜기가 없는데 영역이 크면 보통 엄지만 핀 상태 등
 
-    # 최대 5개로 제한
-    if fingers > 5:
-        fingers = 5
+    # 결과 텍스트 삽입
+    cv2.putText(output, f"Fingers: {fingers}", (20, 50), 
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 0, 0), 3)
 
-    # 결과 표시
-    cv2.putText(
-        output,
-        f"Fingers: {fingers}",
-        (30, 60),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1.5,
-        (0, 0, 255),
-        3
-    )
-
-    return output, mask, fingers, "성공"
-
+    return output, mask, fingers, "분석 성공"
 
 # -----------------------------
-# 파일 선택
+# 실행부
 # -----------------------------
 root = tk.Tk()
 root.withdraw()
 
 file_path = filedialog.askopenfilename(
     title="손 사진을 선택하세요",
-    filetypes=[
-        ("Image files", "*.jpg *.jpeg *.png *.bmp"),
-        ("All files", "*.*")
-    ]
+    filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp")]
 )
 
 if not file_path:
-    print("사진을 선택하지 않았습니다.")
-    exit()
+    print("사진이 선택되지 않았습니다.")
+    sys.exit()
 
-# -----------------------------
-# 이미지 읽기
-# -----------------------------
-# 한글 경로도 읽을 수 있게 하는 방식
+# 한글 경로 포함 이미지 로드
 img_array = np.fromfile(file_path, np.uint8)
 img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
 
 if img is None:
-    print("이미지를 읽을 수 없습니다.")
-    print("선택한 파일 경로:", file_path)
-    exit()
+    print("이미지를 불러올 수 없습니다.")
+    sys.exit()
 
-# -----------------------------
-# 손가락 개수 세기
-# -----------------------------
 result_img, mask_img, count, message = count_fingers(img)
 
-print(message)
-print("추정 손가락 개수:", count)
+print(f"결과 메시지: {message}")
+print(f"추정 손가락 개수: {count}")
 
-# -----------------------------
-# 화면 출력
-# -----------------------------
-cv2.imshow("Original Result", result_img)
-cv2.imshow("Skin Mask", mask_img)
+cv2.imshow("Result (Press any key to exit)", result_img)
+cv2.imshow("Skin Detection Mask", mask_img)
 
-print("창에서 아무 키나 누르면 종료됩니다.")
 cv2.waitKey(0)
 cv2.destroyAllWindows()
